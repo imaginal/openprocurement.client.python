@@ -6,13 +6,19 @@ from .exceptions import http_exceptions_dict, InvalidResponse, RequestFailed
 from functools import wraps
 from io import FileIO
 from munch import munchify
-from os import path
+from os import path, getenv
 from requests import Session
 from requests.auth import HTTPBasicAuth as BasicAuth
 from simplejson import loads
 
 logger = logging.getLogger(__name__)
 IGNORE_PARAMS = ('uri', 'path')
+ALLOW_INSECURE_REQUESTS = getenv('ALLOW_INSECURE_REQUESTS')
+
+if ALLOW_INSECURE_REQUESTS:
+    from requests.packages import urllib3
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    urllib3.disable_warnings(InsecureRequestWarning)
 
 
 def verify_file(fn):
@@ -55,9 +61,12 @@ def verify_file(fn):
 class APITemplateClient(object):
     """base class for API"""
 
-    def __init__(self, login_pass=None, headers=None, user_agent=None):
+    def __init__(self, login_pass=None, headers=None, user_agent=None,
+                 allow_insecure=False):
         self.headers = headers or {}
         self.session = Session()
+        if allow_insecure or ALLOW_INSECURE_REQUESTS:
+            self.session.verify = False
         if login_pass is not None:
             self.session.auth = BasicAuth(*login_pass)
 
@@ -100,11 +109,14 @@ class APIBaseClient(APITemplateClient):
                  api_version=None,
                  params=None,
                  ds_client=None,
-                 user_agent=None):
+                 user_agent=None,
+                 allow_insecure=False):
 
         super(APIBaseClient, self)\
-            .__init__(login_pass=(key, ''), headers=self.headers,
-                      user_agent=user_agent)
+            .__init__(login_pass=(key, ''),
+                      headers=self.headers,
+                      user_agent=user_agent,
+                      allow_insecure=allow_insecure)
 
         self.ds_client = ds_client
         self.host_url = host_url or self.host_url
