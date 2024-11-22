@@ -15,10 +15,15 @@ from openprocurement_client.exceptions import (
 
 
 DEFAULT_RETRIEVERS_PARAMS = {
+    'allow_insecure': False,
+    'infinite_backward': False,
+    'with_fast_backward': False,
     'down_requests_sleep': 5,
     'up_requests_sleep': 1,
     'up_wait_sleep': 30,
     'up_wait_sleep_min': 5,
+    'fb_work_cycle': 900,
+    'fb_requests_sleep': 5,
     'queue_size': 101
 }
 
@@ -115,7 +120,10 @@ class ResourceFeeder(object):
 
         self.forward_priority = 1 if with_priority else 0
         self.backward_priority = 1000 if with_priority else 0
-
+        self.fast_backward_priority = 1000 if with_priority else 0
+        self.with_fast_backward = retrievers_params.get('with_fast_backward')
+        self.infinite_backward = retrievers_params.get('infinite_backward')
+        self.allow_insecure = retrievers_params.get('allow_insecure')
 
     def init_api_clients(self):
         logger.debug('Init forward and backward clients...')
@@ -125,12 +133,22 @@ class ResourceFeeder(object):
         self.forward_params.update(self.extra_params)
         self.forward_client = TendersClientSync(
             self.key, resource=self.resource, host_url=self.host,
-            api_version=self.version)
+            api_version=self.version, allow_insecure=self.allow_insecure)
         self.backward_client = TendersClientSync(
             self.key, resource=self.resource, host_url=self.host,
-            api_version=self.version)
+            api_version=self.version, allow_insecure=self.allow_insecure)
         self.cookies = self.forward_client.session.cookies =\
             self.backward_client.session.cookies
+        if self.with_fast_backward:
+            self.fast_backward_params = {'descending': True, 'feed': 'changes'}
+            self.fast_backward_params.update(self.extra_params)
+            self.fast_backward_client = TendersClientSync(
+                self.key, resource=self.resource, host_url=self.host,
+                api_version=self.version, allow_insecure=self.allow_insecure)
+            self.fast_backward_client.session.cookies =\
+                self.backward_client.session.cookies
+            self.fast_backward_work_cycle =\
+                self.retrievers_params.get('fb_work_cycle', 900)
 
     def handle_response_data(self, data, priority=0):
         if not priority:
@@ -146,7 +164,7 @@ class ResourceFeeder(object):
                 self.restart_sync()
                 logger.warning(
                     'Restart sync, reason: Last response from forward greater'
-                    'than 15 min ago.'
+                    'than {} min ago.'.format(DEFAULT_FORWARD_HEARTBEAT / 60)
                 )
             sleep(300)
 
@@ -161,6 +179,10 @@ class ResourceFeeder(object):
         self.backward_params['offset'] = response.next_page.offset
         self.forward_params['offset'] = response.prev_page.offset
 
+        if self.with_fast_backward:
+            self.fast_backward_params['offset'] = response.next_page.offset
+            self.fast_backward_worker = spawn(self.retriever_fast_backward)
+
         self.backward_worker = spawn(self.retriever_backward)
         self.forward_worker = spawn(self.retriever_forward)
         self.forward_heartbeat = time()
@@ -174,6 +196,8 @@ class ResourceFeeder(object):
         logger.info('Restart workers')
         self.forward_worker.kill()
         self.backward_worker.kill()
+        if self.with_fast_backward:
+            self.fast_backward_worker.kill()
         self.watcher.kill()
         self.init_api_clients()
         self.start_sync()
@@ -259,6 +283,37 @@ class ResourceFeeder(object):
         spawn(self.feeder)
         return self.queue
 
+    def retriever_fast_backward(self):
+        self.fast_backward_start = False
+        while True:
+            if (not self.fast_backward_start or not response or not response.data or
+                    (time() - self.fast_backward_start > self.fast_backward_work_cycle)):
+                logger.info('Fast Backward: pause between work cycles {} sec.'.format(
+                    self.fast_backward_work_cycle))
+                sleep(self.fast_backward_work_cycle)
+                self.fast_backward_start = time()
+                self.fast_backward_params['offset'] = self.forward_params['offset']
+                logger.info('Fast Backward: Start worker')
+            # request
+            logger.debug('Fast Backward: Start process request.')
+            response = get_response(self.fast_backward_client, self.fast_backward_params)
+            logger.debug('Fast Backward response length {} items'.format(
+                len(response.data)),
+                extra={'FAST_BACKWARD_RESPONSE_LENGTH': len(response.data)})
+            if self.cookies != self.fast_backward_client.session.cookies:
+                raise Exception('LB Server mismatch')
+            if response.data:
+                logger.debug('Fast Backward: Start process data.')
+                self.handle_response_data(response.data, self.fast_backward_priority)
+            self.fast_backward_params['offset'] = response.next_page.offset
+            self.log_retriever_state(
+                'FastBackward', self.fast_backward_client, self.fast_backward_params)
+            logger.info('Fast Backward: pause between requests {} sec.'.format(
+                self.retrievers_params.get('fb_requests_sleep', 5)))
+            sleep(self.retrievers_params.get('fb_requests_sleep', 5))
+        logger.info('Fast Backward: finished')
+        return 0
+
     def retriever_backward(self):
         logger.info('Backward: Start worker')
         response = get_response(self.backward_client, self.backward_params)
@@ -275,6 +330,11 @@ class ResourceFeeder(object):
                 'Backward', self.backward_client, self.backward_params)
             logger.debug('Backward: Start process request.')
             response = get_response(self.backward_client, self.backward_params)
+            if not response.data and self.infinite_backward:
+                self.backward_params['offset'] = self.forward_params['offset']
+                logger.info('Backward: finished, restart with offset {}'.format(
+                    self.backward_params['offset']))
+                response = get_response(self.backward_client, self.backward_params)
             logger.debug('Backward response length {} items'.format(
                 len(response.data)),
                 extra={'BACKWARD_RESPONSE_LENGTH': len(response.data)})
